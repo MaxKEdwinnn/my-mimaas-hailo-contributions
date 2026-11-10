@@ -63,8 +63,8 @@ End-to-end on Raspberry Pi 5 + Hailo-10H (from `docs/hailo_benchmark_for_excel.c
 
 | Model | Status | FPS |
 |---|---|---|
-| MobileNetV3-Small | ✅ pass (with avgpool `a16_w16` workaround) | ~467 |
-| EfficientNet-Lite family | ✅ pass | up to ~167 |
+| MobileNetV3-Small |  pass (with avgpool `a16_w16` workaround) | ~467 |
+| EfficientNet-Lite family |  pass | up to ~167 |
 | Classification / detection / segmentation HEFs | 14/14 tested | see report |
 
 ## Skills demonstrated
