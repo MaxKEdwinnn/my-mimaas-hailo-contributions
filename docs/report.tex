@@ -1,0 +1,529 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{caption}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\titleformat{\section}{\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{1em}{}
+
+\title{\textbf{MIMaaS: Extending a Machine-Intelligence-as-a-Service Platform\\
+from Microcontrollers to Edge NPUs}\\[0.3em]
+\large Internship Final Report}
+\author{Maxime \\ AnkiLab}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report summarizes the work carried out during an internship at AnkiLab on the
+\emph{MIMaaS} (Machine Intelligence with Microcontroller/NPU as a Service) platform.
+The project started from an existing service that benchmarks TensorFlow Lite models
+on microcontrollers (MCUs) over Zephyr RTOS, and extended it to support the
+Hailo-10H edge NPU accelerator on a Raspberry Pi 5. The work covered restructuring
+of the existing MCU codebase, fixing Zephyr/TFLite-Micro compatibility issues,
+building a new hardware backend for Hailo, and running a systematic compatibility
+and performance study of 30+ neural network architectures on the Hailo Dataflow
+Compiler (DFC) 5.3.0 toolchain. Of the models tested, 14 pre-compiled reference
+networks passed with 100\% success, and of 24 additional TensorFlow/Keras
+architectures (17 common CNN backbones plus 7 small, purpose-built models each
+probing a single architectural feature) converted to TFLite, 16 compiled and
+ran successfully while 8 failed for seven distinct, well-characterized root
+causes. This report presents the
+architecture, methodology, quantitative results, and a discussion of the
+recurring failure patterns observed, together with recommendations for future work.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction and Motivation}
+
+Edge inference of deep neural networks is increasingly deployed across a wide
+spectrum of hardware, from ultra-low-power microcontrollers (MCUs) to dedicated
+neural processing units (NPUs). Developers and researchers who want to evaluate
+whether a given model is deployable on a given piece of hardware are typically
+forced to install vendor-specific toolchains, understand board-specific
+flashing procedures, and manually instrument power/latency measurements. This is
+a significant barrier, especially for teams that want to compare multiple
+hardware targets before committing to one.
+
+\emph{MIMaaS} (Machine Intelligence with Microcontroller-as-a-Service) is a
+platform developed at AnkiLab that removes this barrier: a user submits a
+\texttt{.tflite} model through a REST API, and the server automatically builds
+firmware (or a hardware-specific binary), flashes it to physical hardware,
+executes inference, and returns hardware-measured metrics (inference time, RAM,
+ROM/flash usage, and, where instrumented, power and energy per inference).
+
+Prior to this internship, MIMaaS supported only microcontroller-class boards
+(Nordic nRF52/nRF53 series, STM32 Nucleo, ESP32-C6) driven by Zephyr RTOS and
+TensorFlow Lite for Microcontrollers (TFLite Micro). The motivation for this
+internship was twofold:
+
+\begin{enumerate}
+  \item \textbf{Consolidate and repair} the existing MCU pipeline, which had
+    accumulated technical debt (a flat, monolithic codebase) and had broken
+    after a Zephyr version migration.
+  \item \textbf{Extend MIMaaS to a new hardware class}: edge NPUs, specifically
+    the Hailo-10H accelerator connected to a Raspberry Pi 5, to evaluate whether
+    the same request/response abstraction (``upload a model, get back
+    performance numbers'') generalizes beyond microcontrollers to
+    dataflow-compiled NPU accelerators.
+\end{enumerate}
+
+\section{Problem Statement}
+
+Two concrete problems were addressed:
+
+\textbf{Problem 1 -- MCU pipeline regression.} After migrating the bundled
+Zephyr RTOS copy to a git submodule (Zephyr v3.7), the MIMaaS build pipeline
+broke for two independent reasons: a missing kernel source file in the
+TFLite-Micro CMake build (\texttt{strided\_slice\_common.cc}), and an upstream
+TFLite-Micro change that dropped support for per-channel quantization in fully
+connected layers -- a quantization scheme commonly produced by standard
+TensorFlow Lite converters. Both had to be diagnosed and fixed without
+breaking previously working models.
+
+\textbf{Problem 2 -- Hailo-10H hardware backend and compatibility mapping.}
+Unlike MCUs (which run an interpreter, TFLite-Micro, that executes arbitrary
+graphs op-by-op), the Hailo-10H is a dataflow accelerator: a model must be
+\emph{compiled ahead-of-time} by the Hailo Dataflow Compiler (DFC) into a
+hardware-specific binary (\texttt{.hef}). This compilation involves graph
+parsing, quantization/calibration, and static resource allocation across the
+chip's compute clusters -- any of which can fail for a given architecture.
+The problem was therefore not just ``build a backend that talks to the
+board'', but also to answer the applied research question: \emph{for a
+representative set of common CNN/Transformer/pose/detection architectures,
+which ones can be compiled for Hailo-10H via DFC~5.3.0 out-of-the-box, and
+what specifically causes the ones that fail to fail?}
+
+\section{System Architecture}
+
+\subsection{MIMaaS Core (existing, restructured)}
+
+MIMaaS follows a producer/consumer architecture: a Flask REST API accepts
+model uploads and enqueues a job; Redis acts as both the Celery message
+broker and a live board-status store (heartbeat-based health tracking with a
+30s TTL); and one Celery worker process per physical board consumes jobs from
+a board-type queue and drives the actual hardware. During the internship, the
+codebase was restructured from a flat script layout into an installable
+Python package (\texttt{src/mimaas/}), with dedicated modules for the API,
+worker, hardware backends, database models, and a YAML-based, environment-aware
+configuration system (\texttt{config/default.yaml}, \texttt{development.yaml},
+\texttt{production.yaml}).
+
+\subsection{Hailo-10H Backend (new)}
+
+The Hailo integration is implemented as a new hardware backend
+(\texttt{src/mimaas/hardware/hailo\_utils.py}) invoked from the core pipeline
+(\texttt{src/mimaas/core/pipeline.py}) whenever a request targets a board of
+type \texttt{hailo\_rpi5}. Because the Hailo DFC toolchain requires a Linux
+environment and is not natively supported on the Windows development machine,
+the backend transparently shells out to WSL2, where DFC~5.3.0 is installed
+inside a dedicated \texttt{pyenv} virtual environment. The pipeline for a
+\texttt{.tflite} input is:
+
+\begin{enumerate}
+  \item \textbf{Parse}: \texttt{hailo parser tf model.tflite --hw-arch hailo10h}
+    $\rightarrow$ \texttt{model.har} (Hailo Archive, an intermediate graph
+    representation).
+  \item \textbf{Optimize}: \texttt{hailo optimize model.har --use-random-calib-set}
+    $\rightarrow$ \texttt{model\_opt.har} (quantization: mixed precision,
+    statistics collection/calibration, hardware-parameter generation).
+  \item \textbf{Compile}: \texttt{hailo compiler model\_opt.har --hw-arch hailo10h}
+    $\rightarrow$ \texttt{model.hef} (resource partitioning across compute
+    clusters/contexts, kernel compilation, final binary).
+\end{enumerate}
+
+If a \texttt{.hef} is supplied directly (e.g. a vendor-provided reference
+model), the compile step is skipped entirely. Once a \texttt{.hef} exists, it
+is transferred to the Raspberry Pi 5 over SSH/SCP (key-based, batch-mode
+authentication) and executed with \texttt{hailortcli}, whose JSON/text output
+(FPS, per-chip temperature) is parsed back into the same result schema used by
+the MCU backends (status, inference time, RAM/ROM usage, power/energy where
+available). This design means the REST API and result schema did not need to
+change to support the new hardware class -- only the backend implementation.
+
+\section{Methodology}
+
+\subsection{MCU Track}
+
+For the MCU track, the focus was on regression-fixing rather than new
+feature work: (1) restoring the TFLite-Micro build after the Zephyr v3.7
+submodule migration by patching the CMake kernel source list; (2) working
+around the upstream removal of per-channel quantization support for dense
+layers in TFLite-Micro, which is incompatible with MIMaaS's requirement to
+accept arbitrary pre-converted \texttt{.tflite} uploads (users cannot be asked
+to re-convert their models with
+\texttt{\_experimental\_disable\_per\_channel\_quantization\_for\_dense\_layers});
+and (3) fixing a metadata bug in the official \texttt{ppk2\_api} package that
+prevented power measurement via the Nordic Power Profiler Kit~2 (PPK2).
+
+\subsection{Hailo Compatibility Study}
+
+For the Hailo track, a corpus of models was assembled from two sources:
+(a)~14 vendor-provided, pre-compiled \texttt{.hef} reference models spanning
+classification, object detection, and segmentation, used to validate the new
+backend end-to-end on known-good binaries; and (b)~17 additional
+classification architectures (MobileNet, ResNet, DenseNet, EfficientNet,
+Inception/Xception, NASNet, ConvNeXt families) plus pose-estimation
+(MoveNet) and audio (YAMNet) models, exported to \texttt{.tflite} from
+Keras/TensorFlow and pushed through the full DFC pipeline described above.
+Each model was tested sequentially (never in parallel, to avoid WSL2 memory
+contention) and its outcome was classified as \emph{pass} (a \texttt{.hef} was
+produced and executed on hardware, FPS/latency/temperature recorded) or
+\emph{fail}, in which case the DFC error trace was inspected to attribute the
+failure to one of the recurring root causes discussed in Section~5.2.
+
+\section{Results}
+
+\subsection{MCU Track}
+
+All three MCU regressions were resolved with targeted, permanent fixes
+committed to the Zephyr submodule / build configuration (documented in
+\texttt{docs/WORKAROUNDS.md}), restoring build and flash compatibility for
+the existing Nordic (nRF52833/nRF52840/nRF5340) and STM32 Nucleo boards
+without requiring any change to already-deployed user models.
+
+\subsection{Hailo Track}
+
+\subsubsection{Reference models (pre-compiled \texttt{.hef})}
+
+All 14 pre-compiled reference models executed successfully on the Hailo-10H
+via the new backend (100\% pass rate), validating the SSH transfer,
+\texttt{hailortcli} invocation, and result-parsing logic end-to-end.
+
+\subsubsection{TFLite$\rightarrow$HEF compatibility matrix}
+
+\begin{longtable}{@{}p{3.6cm}p{1.4cm}p{1.3cm}p{1.5cm}p{1.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Model} & \textbf{Status} & \textbf{FPS} & \textbf{Lat.\ (ms)} & \textbf{ROM (MB)} & \textbf{Notes} \\
+\midrule
+\endhead
+MobileNetV1 & Pass & 1634.0 & 0.61 & 3.30 & Fastest model in the whole corpus \\
+MobileNetV3-Small & Pass* & 466.6 & 2.14 & 3.27 & Fixed via 16-bit \texttt{avgpool} precision \\
+MobileNetV3-Large & Pass & 301.2 & 3.32 & 5.76 & \\
+ResNet50 & Pass & 261.8 & 3.82 & 19.86 & \\
+ResNet50V2 & Pass & 239.2 & 4.18 & 19.82 & \\
+DenseNet121 & Pass & 208.7 & 4.79 & 8.60 & \\
+EfficientNetV2-B0 & Pass & 199.9 & 5.00 & 8.85 & \\
+InceptionV3 & Pass & 166.6 & 6.00 & 19.50 & \\
+DenseNet169 & Pass & 135.8 & 7.36 & 13.82 & \\
+DenseNet201 & Pass & 105.7 & 9.46 & 18.85 & 43 min compile \\
+Xception & Pass & 85.6 & 11.68 & 19.50 & Highest latency among passing models \\
+InceptionResNetV2 & Pass & 68.1 & 14.68 & 39.78 & 2h17min compile (longest in corpus) \\
+EfficientNetB0 & Pass* & 138.2 & 7.24 & 6.03 & Fixed via 16-bit \texttt{avgpool1} \\
+EfficientNetB3 & \textbf{Fail} & -- & -- & -- & Same class as B0, \emph{not} fixable (Sec.~5.2.1) \\
+NASNetMobile & \textbf{Fail} & -- & -- & -- & Non-scalar element-wise ratio (Sec.~5.2.2) \\
+ConvNeXt-Tiny & \textbf{Fail} & -- & -- & -- & LayerNorm unsupported ops (Sec.~5.2.3) \\
+YOLOv8n & \textbf{Fail} & -- & -- & -- & Exporter incompatibility (Sec.~5.2.4) \\
+YOLOv8s & \textbf{Fail} & -- & -- & -- & Exporter incompatibility (Sec.~5.2.4) \\
+MoveNet Lightning & \textbf{Fail} & -- & -- & -- & DFC translator bug (Sec.~5.2.5) \\
+MoveNet Thunder & \textbf{Fail} & -- & -- & -- & DFC translator bug (Sec.~5.2.5) \\
+YAMNet & \textbf{Fail} & -- & -- & -- & 1-D input unsupported \\
+VGG16 & Abandoned & -- & -- & -- & WSL2 memory exhaustion, not a DFC limitation \\
+\bottomrule
+\caption{Compatibility results for TensorFlow/Keras models converted to TFLite
+and compiled with Hailo DFC~5.3.0 for the Hailo-10H target. Entries marked
+\emph{Pass*} required a model-script quantization override before compiling
+successfully. All FPS/latency/ROM/temperature values were measured on
+physical Hailo-10H hardware via \texttt{hailortcli}.}
+\end{longtable}
+
+Table~2 lists the 14 pre-compiled reference \texttt{.hef} models (100\% pass,
+no DFC compilation involved), also measured on hardware, for completeness:
+
+\begin{longtable}{@{}p{4cm}p{1.4cm}p{1.3cm}p{1.6cm}p{1.9cm}@{}}
+\toprule
+\textbf{Model} & \textbf{FPS} & \textbf{Lat.\ (ms)} & \textbf{HEF (MB)} & \textbf{Temp.\ (°C)} \\
+\midrule
+\endhead
+cas\_vit\_t & 62.5 & 16.01 & 24.84 & 48.7 \\
+deit\_small & 125.0 & 8.00 & 24.50 & 50.1 \\
+hardnet39ds & 563.9 & 1.77 & 3.75 & 50.5 \\
+hardnet68 & 219.0 & 4.57 & 16.63 & 51.3 \\
+unet\_mobilenet\_v2 & 667.4 & 1.50 & 8.23 & 60.7 \\
+deeplab\_v3\_mobilenet\_v2 & 50.6 & 19.78 & 2.52 & 56.9 \\
+deeplab\_v3\_mobilenet\_v2\_wo\_dilation & 354.3 & 2.82 & 2.59 & 60.4 \\
+fcn8\_resnet\_v1\_18 & 31.4 & 31.89 & 9.18 & 59.8 \\
+stdc1 & 20.2 & 49.60 & 10.80 & 58.9 \\
+ssd\_mobilenet\_v1 & 190.0 & 5.26 & 4.94 & 57.7 \\
+tiny\_yolov4 & 562.0 & 1.78 & 4.54 & 64.8 \\
+yolov5s\_bbox\_decoding\_only & 27.8 & 35.92 & 12.43 & 59.5 \\
+yolo26m & 58.8 & 17.02 & 21.60 & 63.3 \\
+yolov11x & 28.3 & 35.29 & 51.73 & 65.8 \\
+\bottomrule
+\caption{Reference \texttt{.hef} models used to validate the Hailo backend
+end-to-end (classification, segmentation, and detection), all 100\% passing.}
+\end{longtable}
+
+Overall, of 17 newly-attempted architectures, 11 (65\%) compiled and executed
+successfully out-of-the-box or with a small quantization override, while 6
+(35\%) failed for reasons attributable to five distinct root causes.
+
+\subsubsection{Novel-risk probes: targeted single-feature stress tests}
+
+To close out the compatibility study, a final round of seven small,
+purpose-built models was run, each isolating exactly \emph{one} architectural
+feature not exercised by any model above (recurrence, native attention,
+pre-quantized weights, pixel-shuffle upsampling, multi-input graphs, dynamic
+batch dimensions, and transposed convolution via this study's own export
+path, rather than a vendor pre-compiled \texttt{.hef}). Being deliberately
+tiny (64--224\,px inputs), each either compiled and ran in under two minutes
+or failed within seconds, making this an efficient way to map remaining
+unknowns.
+
+\begin{longtable}{@{}p{4cm}p{1.3cm}p{1.3cm}p{6.4cm}@{}}
+\toprule
+\textbf{Model} & \textbf{Status} & \textbf{FPS} & \textbf{Feature probed / outcome} \\
+\midrule
+\endhead
+Tiny LSTM classifier & Pass & 3379.7 & Recurrent (LSTM) layer -- \emph{unexpectedly compiled}; with a fixed sequence length of 16 the TFLite converter most likely fully unrolled the recurrence into static ops, so this does not demonstrate true dynamic recurrence support \\
+Tiny attention block & \textbf{Fail} & -- & Native \texttt{MultiHeadAttention} -- rejected on multiple simultaneous grounds: \texttt{BATCH\_MATMUL} unsupported (attention score/context matmuls), attention-reshape ops unresolvable, plus the same LayerNorm-via-moments issue as ConvNeXt (Sec.~5.2.3) \\
+MobileNetV2 (INT8 pre-quantized) & \textbf{Fail} & -- & Fully-integer-quantized TFLite input -- explicit \texttt{UnsupportedQuantizedWeightsError}: DFC requires float32/16 weights and performs its own quantization; a model already quantized to int8 is rejected outright \\
+Tiny ESPCN (super-resolution) & Pass & 867.4 & \texttt{DepthToSpace} (pixel-shuffle upsampling) -- compiled and ran without issue \\
+Tiny Siamese (2 inputs) & Pass & 599.9 & Two independent graph inputs merged mid-graph -- supported, though compilation took $\sim$11\,min (longest of the seven, consistent with a more complex partitioning search) \\
+MobileNetV2 (dynamic batch) & Pass & 1322.7 & Unspecified/dynamic leading batch dimension -- supported without modification \\
+Tiny U-Net (\texttt{Conv2DTranspose}) & Pass & 2442.7 & Transposed convolution via this study's own TFLite$\rightarrow$DFC path (previously only seen in a vendor pre-compiled \texttt{.hef}) -- supported \\
+\bottomrule
+\caption{Novel-risk probes: seven small, single-feature models designed to
+surface failure categories not covered by Sections 5.2.1--5.2.5. FPS/latency
+measured on hardware via \texttt{hailortcli} for passing models.}
+\end{longtable}
+
+Two new, cleanly-attributable failure categories emerged: \textbf{(6) native
+multi-head attention} (a combination of unsupported batched matrix
+multiplication and the same LayerNorm decomposition issue already seen with
+ConvNeXt) and \textbf{(7) pre-quantized INT8 input rejection} (DFC insists on
+owning the quantization step itself and refuses an already-quantized model
+outright, with a clear, actionable error message). Five of the seven probed
+features -- multi-input graphs, dynamic batch dimensions, transposed
+convolution, pixel-shuffle upsampling, and statically-unrollable recurrence
+-- compiled without any workaround, indicating the DFC~5.3.0 parser's op
+coverage is broader than the earlier classification-model failures alone
+would suggest; failures are concentrated specifically around
+\emph{quantization semantics} (avgpool shift-delta, non-scalar ratios,
+pre-quantized weights) and \emph{LayerNorm/attention op decomposition},
+rather than graph topology in general.
+
+\section{Discussion}
+
+\subsection{Root-cause taxonomy of DFC compilation failures}
+
+\subsubsection{Global-average-pool quantization shift-delta overflow}
+\textbf{Affected: MobileNetV3-Small (fixed), EfficientNetB0 (fixed),
+EfficientNetB3 (not fixable).} The Hailo optimizer quantizes each
+\texttt{avgpool} operation with an internal ``shift'' representing the scale
+change between input and output; DFC enforces a maximum shift delta of~2.
+Architectures whose global-average-pool operates over a wide dynamic range
+(common in MobileNetV3's h-swish/SE blocks and EfficientNet's
+squeeze-and-excitation blocks) can exceed this limit. For MobileNetV3-Small
+(delta 2.87) and EfficientNetB0 (delta 4.73 on its single \texttt{avgpool1}),
+forcing that specific layer to 16-bit precision via a model-script command
+(\texttt{quantization\_param(avgpool1, precision\_mode=a16\_w16)}) resolved the
+issue. For EfficientNetB3, which contains many more squeeze-and-excitation
+blocks (each with its own average-pool), the same fix on \texttt{avgpool1}
+immediately surfaced an identical error on \texttt{avgpool2} (delta~5.05);
+patching every affected average-pool individually was judged impractical for
+this study and the model was classified as non-fixable within the time
+available. This suggests a general pattern: \emph{the more squeeze-excitation
+blocks a model has, the less likely a single-layer quantization override is
+sufficient}, and a systematic script (auto-detecting and patching all
+average-pool layers) would be needed for larger EfficientNet variants.
+
+\subsubsection{Non-scalar element-wise-multiply ratio}
+\textbf{Affected: NASNetMobile.} A distinct quantization failure in an
+\texttt{ElementWiseMult} layer, where DFC's optimizer assumes the ratio
+between output and input scale is a scalar, but NASNetMobile's branch
+structure produces a per-channel ratio. Unlike the average-pool issue above,
+forcing 16-bit precision did not resolve this failure, indicating an
+architectural incompatibility rather than a precision-budget problem.
+
+\subsubsection{Unsupported LayerNorm decomposition (ConvNeXt family)}
+\textbf{Affected: ConvNeXt-Tiny.} ConvNeXt's LayerNorm is exported by the
+TFLite converter as an explicit \texttt{moments} computation (mean +
+\texttt{SquaredDifference} + variance), rather than a fused normalization op.
+The Hailo parser rejects both the \texttt{SQUARED\_DIFFERENCE} op (unsupported
+entirely) and any \texttt{ReduceMean} whose reduction axis is the channel axis
+(DFC requires reductions to be spatial, i.e.\ equivalent to a global average
+pool). This is a graph-\emph{translation} failure at the parser stage
+(occurring within 20 seconds, before any quantization work begins), not a
+numerical/quantization failure, and is not fixable without re-exporting the
+model with a different LayerNorm implementation or waiting for parser support.
+This is classified as \textbf{non-fixable} in the current DFC version.
+
+\subsubsection{Exporter-introduced unsupported ops (YOLOv8)}
+\textbf{Affected: YOLOv8n, YOLOv8s.} Both failed during parsing with
+\texttt{UnsupportedShuffleLayerError} / \texttt{UnsupportedModelError},
+traced to the Ultralytics \texttt{litert\_torch} TFLite exporter producing a
+detection head with operations (\texttt{TRANSPOSE}, \texttt{DFL}, \texttt{EWAdd})
+and a channel-shape mismatch inside a C2f block that the parser cannot
+translate. This is an \emph{export-tool} incompatibility rather than a DFC or
+model-architecture limitation; a different export path (e.g.\ ONNX
+$\rightarrow$ Hailo's dedicated YOLO parsing flow, which several published
+Hailo Model Zoo YOLO variants use) would likely avoid this failure mode
+entirely.
+
+\subsubsection{Internal DFC translator bug on non-4D tensors (MoveNet)}
+\textbf{Affected: MoveNet Lightning, MoveNet Thunder.} Both crash with an
+\texttt{IndexError} deep inside Hailo's own \texttt{format\_conversion.py},
+reproduced twice with identical stack traces and unaffected by toggling
+\texttt{SELECT\_TF\_OPS} at export time. This points to a bug in Hailo's
+internal format-conversion layer when handling MoveNet's non-4D intermediate
+tensor shapes, rather than an issue in the exported model itself; it is
+plausible this is fixed in a newer DFC release, but this was not verifiable
+within DFC~5.3.0.
+
+\subsubsection{Native multi-head attention (transformer blocks)}
+\textbf{Affected: a minimal \texttt{MultiHeadAttention} probe model.} Beyond
+the LayerNorm-via-moments issue already characterized for ConvNeXt, attention
+blocks fail for an additional, independent reason: the batched matrix
+multiplications used to compute attention scores and context vectors
+(\texttt{BATCH\_MATMUL}) are unsupported outright by the DFC~5.3.0 parser, as
+are several of the reshape/einsum operations Keras's \texttt{MultiHeadAttention}
+emits internally. This is therefore a \textbf{compound failure}: even if the
+LayerNorm issue were worked around, native attention would still fail on the
+matmul/reshape ops. Transformer-style architectures should be considered
+unsupported by this DFC version until at least one of these two independent
+issues is resolved upstream.
+
+\subsubsection{Pre-quantized (INT8) TFLite input rejection}
+\textbf{Affected: a MobileNetV2 export using full-integer post-training
+quantization.} DFC is designed to own the quantization step itself (via its
+Optimizer stage) and explicitly rejects a \texttt{.tflite} file whose weights
+are already quantized to int8/int32, raising a clear
+\texttt{UnsupportedQuantizedWeightsError} at the parser stage rather than
+attempting a (likely incorrect) double quantization. This is not a bug but a
+deliberate design constraint: \textbf{MIMaaS users targeting Hailo-10H must
+supply float32/float16 \texttt{.tflite} exports}, never a pre-quantized
+INT8 model, which is a useful, actionable constraint to surface to end users
+of a future Hailo-enabled MIMaaS endpoint.
+
+\subsection{Environment constraints}
+
+Two failures were not architectural at all: \textbf{YAMNet} was rejected
+because DFC requires a 4D (image-like) input tensor and YAMNet's native input
+is a 1D waveform; and \textbf{VGG16} was abandoned after $>$1h40min of
+compilation without completion, attributable to the interaction of its
+138M-parameter, dense-layer-heavy architecture (a 103M-parameter first dense
+layer alone) with the shared, memory-constrained WSL2 VM (14GB available),
+rather than a hard DFC resource limit -- large dense networks should be
+retried on a machine with more available memory or a native Linux
+installation of DFC before being written off entirely.
+
+\subsection{Compilation time variability}
+
+Compilation time varied by more than two orders of magnitude across the
+corpus tested: from single-digit minutes for smaller MobileNet/DenseNet
+variants up to \textbf{2 hours 17 minutes} for InceptionResNetV2, driven
+primarily by the multi-context partition search (DFC's iterative search for
+a valid layer-to-cluster assignment across multiple hardware execution
+contexts). This has direct practical implications for how such a
+compatibility study -- or a future automated MIMaaS Hailo endpoint -- should
+be scheduled: compilation cannot be assumed to complete within a fixed
+timeout, and strictly sequential (non-parallel) execution is necessary on a
+single shared WSL2 VM to avoid out-of-memory failures during concurrent
+compilations.
+
+\section{Conclusion and Future Work}
+
+This internship delivered two concrete outcomes. First, the existing
+MIMaaS MCU pipeline was repaired and restructured into a maintainable Python
+package, resolving a post-migration regression that had left three board
+families unable to build or run TFLite-Micro models. Second, MIMaaS was
+successfully extended to a new class of hardware -- the Hailo-10H edge NPU --
+via a new backend that reuses the platform's existing API/result contract,
+and this new backend was used to run the first systematic Hailo-10H DFC~5.3.0
+compatibility study across 30+ well-known architectures, producing (a)~a
+reference performance table for models that compile out-of-the-box and
+(b)~a root-cause taxonomy for the ones that do not, distinguishing
+\emph{fixable} quantization issues (single average-pool overrides),
+\emph{architecturally non-fixable} issues (non-scalar ratios, unsupported
+LayerNorm decomposition, native attention), \emph{exporter-specific} issues
+(YOLOv8), \emph{compiler-internal bugs} (MoveNet), and \emph{deliberate
+design constraints} (rejection of pre-quantized INT8 inputs).
+
+Recommended future work: (1)~automate detection and patching of \emph{all}
+problematic average-pool/SE-block layers in a model script, rather than a
+single hard-coded layer name, to recover larger EfficientNet variants;
+(2)~evaluate an ONNX-based export path for YOLO-family detectors, which is
+better supported by Hailo's tooling than the current TFLite exporter;
+(3)~re-run the MoveNet and VGG16 cases against a newer DFC release and/or a
+native Linux host to separate compiler bugs and environment limits from true
+architectural incompatibilities; and (4)~expose the Hailo backend through the
+same MIMaaS REST API used for MCU boards, so that end users can request
+Hailo-10H evaluations without needing direct WSL2/DFC access, using the
+compatibility matrix in Section~5 to set user expectations up front.
+
+\section{Personal Reflection}
+
+\textit{[Draft below -- please edit freely, this is meant as a starting
+point reflecting what was actually done, not a template to fill mechanically.]}
+
+Coming into this internship with some general programming background but no
+prior hands-on exposure to embedded ML deployment, edge NPUs, or production-grade
+service architecture, three things stood out as the most valuable learning
+outcomes.
+
+\textbf{Reading a system before changing it.} The first real task was not
+writing new code but understanding and repairing an existing pipeline
+(MIMaaS's MCU backend) after a dependency migration broke it. This required
+tracing a build error and a runtime error back through several layers --
+CMake source lists, a third-party TFLite-Micro upstream change, a hardware
+API library -- before a one-line fix could be applied with confidence. The
+lesson that stuck: most real engineering work is understanding \emph{why}
+something that used to work no longer does, not writing code from a blank
+page.
+
+\textbf{Ahead-of-time compilation is a fundamentally different failure mode
+than interpreted inference.} Prior experience with TensorFlow Lite had been
+limited to running an interpreter, where a model either loads or does not,
+and errors are usually about missing/unsupported ops. Working with the Hailo
+Dataflow Compiler was a different experience entirely: a model can pass
+parsing, pass calibration, and still fail deep inside \emph{quantization
+arithmetic} (the average-pool shift-delta errors) or during \emph{static
+resource allocation} (multi-context partition search taking over an hour for
+some architectures). This distinction -- between ``does the graph contain
+supported operations'' and ``can this graph be statically compiled onto a
+fixed amount of hardware'' -- is, in hindsight, the core conceptual
+difference between deploying to a general-purpose interpreter (MCU/CPU) and
+deploying to a dataflow accelerator (NPU), and it shaped how the whole
+compatibility study was organized (grouping failures by \emph{which stage of
+the toolchain} they occurred in, rather than just pass/fail).
+
+\textbf{Negative results are still results, if the cause is precise enough.}
+Roughly a third of the new architectures tested failed to compile. Early on,
+the instinct was to see this as simply ``incomplete work''. Reframing each
+failure as a small root-cause investigation (attributing NASNetMobile,
+ConvNeXt, YOLOv8, and MoveNet to four \emph{different} causes, rather than a
+single ``Hailo doesn't support X'' bucket) turned out to be far more useful,
+both for this report and, hopefully, for anyone at AnkiLab who later tries
+one of these architectures again on a newer DFC version: knowing precisely
+\emph{why} something fails tells you whether it is worth retrying later
+(a compiler bug, possibly fixed upstream), worth fixing on the export side
+(YOLOv8's exporter), or a genuine current limitation of the hardware/toolchain
+(non-scalar quantization ratios, unsupported LayerNorm decomposition).
+
+More generally, this internship was a good introduction to the gap between
+``a model works on my laptop'' and ``a model is deployable on a specific
+piece of edge hardware'' -- a gap that, in industry, is exactly what a
+platform like MIMaaS exists to make legible to non-hardware-expert users.
+
+\appendix
+\section*{Appendix: Reproducing the Results}
+See the accompanying \emph{MIMaaS + Hailo-10H Setup Manual} for full
+installation and reproduction instructions. All quantitative results in
+Section~5 were produced via the \texttt{flash\_and\_evaluate()} entry point in
+\texttt{src/mimaas/core/pipeline.py}, which is hardware-agnostic and dispatches
+to \texttt{src/mimaas/hardware/hailo\_utils.py} for boards of type
+\texttt{hailo\_rpi5}.
+
+\end{document}

@@ -1,0 +1,26 @@
+model;family;test_source;status;fps;inference_latency_ms;hef_rom_mb;compile_time_s;compile_time_min;temp_mean_c;temp_min_c;temp_max_c;notes
+mobilenetv1;MobileNet;TFLite_to_HEF_MIMaaS;pass;1634.00;0.612;3.297;;;;52.44;43.94;55.27;Fastest main benchmark model
+mobilenetv3small;MobileNet;TFLite_to_HEF_MIMaaS;pass;466.57;2.143;3.273;;;;42.52;39.85;43.59;Required avgpool1 a16_w16 workaround
+mobilenetv3large;MobileNet;TFLite_to_HEF_MIMaaS;pass;301.16;3.320;5.758;;;;43.59;40.86;44.80;
+resnet50;ResNet;TFLite_to_HEF_MIMaaS;pass;261.83;3.819;19.855;;;;46.12;41.11;48.14;
+resnet50v2;ResNet;TFLite_to_HEF_MIMaaS;pass;239.19;4.181;19.820;;;;45.24;40.65;46.93;
+densenet121;DenseNet;TFLite_to_HEF_MIMaaS;pass;208.70;4.792;8.598;;;;48.09;44.55;49.61;
+efficientnetv2b0;EfficientNetV2;TFLite_to_HEF_MIMaaS;pass;199.91;5.002;8.848;;;;49.00;48.04;49.56;
+inceptionv3;Inception;TFLite_to_HEF_MIMaaS;pass;166.64;6.001;19.504;;;;51.89;48.60;53.25;
+efficientnetb0;EfficientNet;TFLite_to_HEF_MIMaaS;pass;138.19;7.236;6.031;;;;42.23;39.95;43.03;Required avgpool1 a16_w16 workaround
+densenet169;DenseNet;TFLite_to_HEF_MIMaaS;pass;135.81;7.363;13.824;;;;50.53;50.37;50.72;
+densenet201;DenseNet;TFLite_to_HEF_MIMaaS;pass;105.69;9.462;18.852;2580;43.00;49.12;45.61;51.03;Compilation time approximately 43 min
+xception;Xception;TFLite_to_HEF_MIMaaS;pass;85.64;11.677;19.496;;;;53.72;51.08;54.82;
+inceptionresnetv2;InceptionResNet;TFLite_to_HEF_MIMaaS;pass;68.12;14.680;39.781;8212.66;136.88;43.07;39.24;44.70;Longest initial benchmark compilation
+resnet101;ResNet;TFLite_to_HEF_MIMaaS;pass;137.19;7.289;34.648;2301.19;38.35;48.35;43.49;50.37;
+resnet101v2;ResNet;TFLite_to_HEF_MIMaaS;pass;117.47;8.513;33.480;1667.96;27.80;48.48;44.30;50.27;
+resnet152;ResNet;TFLite_to_HEF_MIMaaS;pass;;;;15859.06;264.32;;;;Metrics were not retained in the current batch log
+resnet152v2;ResNet;TFLite_to_HEF_MIMaaS;pass;79.96;12.506;45.047;2038.98;33.98;45.09;40.81;46.72;
+resnet50_res224;ResNet;TFLite_to_HEF_MIMaaS;pass;268.03;3.731;19.750;1130.54;18.84;46.83;41.62;48.85;Independent re-export at 224x224
+efficientnetv2s;EfficientNetV2;TFLite_to_HEF_MIMaaS;pass;33.61;29.753;22.797;9467.38;157.79;41.37;38.93;42.53;
+efficientnetv2m;EfficientNetV2;TFLite_to_HEF_MIMaaS;pass;19.79;50.531;53.664;18299.51;304.99;39.81;36.61;41.41;Current compilation-time record
+tiny_lstm_classifier;Custom_LSTM;TFLite_to_HEF_MIMaaS;pass;3379.65;0.296;0.027;65.89;1.10;45.18;39.90;46.57;Fixed sequence length 16
+tiny_espcn_superres;Custom_ESPCN;TFLite_to_HEF_MIMaaS;pass;867.35;1.153;0.074;68.91;1.15;44.96;40.76;46.37;DepthToSpace supported
+tiny_siamese_multi_input;Custom_Siamese;TFLite_to_HEF_MIMaaS;pass;599.88;1.667;5.227;666.55;11.11;44.94;40.50;46.67;Two graph inputs supported
+mobilenetv2_dynamic_batch;MobileNet;TFLite_to_HEF_MIMaaS;pass;1322.74;0.756;3.531;158.00;2.63;48.67;40.71;51.43;Dynamic batch accepted
+tiny_unet_transposed_conv;Custom_UNet;TFLite_to_HEF_MIMaaS;pass;2442.73;0.409;0.098;66.99;1.12;47.19;41.92;48.75;Conv2DTranspose supported

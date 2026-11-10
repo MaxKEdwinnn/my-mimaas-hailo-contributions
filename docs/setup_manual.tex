@@ -1,0 +1,280 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\titleformat{\section}{\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{1em}{}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{\textbf{MIMaaS + Hailo-10H Setup Manual}\\
+\large Raspberry Pi 5, Hailo Dataflow Compiler, and the MIMaaS server}
+\author{Maxime \\ AnkiLab}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Overview}
+
+This manual describes how to set up the hardware and software required to
+run the Hailo-10H backend of MIMaaS end-to-end, from a fresh Raspberry Pi~5
+to a successful \texttt{flash\_and\_evaluate()} call. It assumes the reader
+already has the base MIMaaS server installed (see the project
+\texttt{README.md} for the generic installation of the Python package,
+Redis, and the database); this document focuses \emph{specifically} on the
+pieces needed for the Hailo-10H target: the Pi~5 itself, the Hailo Dataflow
+Compiler (DFC), and the WSL2 bridge used to invoke it from a Windows
+development machine.
+
+\textbf{Architecture recap.} Model compilation (TFLite $\rightarrow$ HEF)
+happens on the \emph{development/server machine} inside WSL2, using the
+Hailo DFC toolchain. The resulting \texttt{.hef} binary is then transferred
+over SSH to the Raspberry~Pi~5, which hosts the physical Hailo-10H module,
+and executed there via \texttt{hailortcli}. The server machine never needs
+direct access to the NPU; the Pi only ever needs \texttt{hailortcli} and the
+runtime, not the full DFC.
+
+\section{Part A -- Raspberry Pi 5 + Hailo-10H}
+
+\subsection{Hardware}
+\begin{itemize}
+  \item Raspberry Pi 5 (4GB or 8GB)
+  \item Hailo-10H M.2/HAT accessory, correctly seated and powered
+  \item Network connectivity between the Pi and the machine running MIMaaS
+    (in this deployment, a static link at \texttt{192.168.42.1})
+\end{itemize}
+
+\subsection{Software on the Pi}
+\begin{enumerate}
+  \item Flash a recent Raspberry Pi OS (64-bit) image and boot the Pi.
+  \item Install the HailoRT runtime and \texttt{hailortcli} following
+    Hailo's official Raspberry Pi installation guide for the Hailo-10H
+    (PCIe/driver setup, \texttt{hailo-pci} kernel module, HailoRT service).
+    Verify the module is detected:
+\begin{lstlisting}
+hailortcli fw-control identify
+\end{lstlisting}
+  This should report the Hailo-10H device and firmware version. If it
+  reports "no device found", check the physical connection and that the
+  \texttt{hailo\_pci} kernel module is loaded (\texttt{lsmod | grep hailo}).
+  \item Enable passwordless SSH key authentication from the MIMaaS server
+    machine to the Pi (the backend uses \texttt{BatchMode=yes}, i.e.\ it
+    will \emph{not} prompt for a password):
+\begin{lstlisting}
+# On the server machine (or inside WSL2):
+ssh-keygen -t ed25519 -f ~/.ssh/mimaas_hailo_pi5
+ssh-copy-id -i ~/.ssh/mimaas_hailo_pi5.pub maxime@192.168.42.1
+
+# Verify non-interactive login works:
+ssh -o BatchMode=yes maxime@192.168.42.1 echo ok
+\end{lstlisting}
+  \item Create a working directory on the Pi for uploaded models, matching
+    the path convention used by the backend (\texttt{/tmp/mimaas/<board>/}
+    for execution, and any directory of your choosing for the source
+    \texttt{.hef} files, e.g.\ \texttt{/home/maxime/models/}).
+\end{enumerate}
+
+\section{Part B -- Hailo Dataflow Compiler (DFC) in WSL2}
+
+The DFC (compiler, optimizer, parser) currently runs only on x86\_64 Linux.
+On a Windows development machine, install it inside WSL2.
+
+\subsection{Install WSL2 and a pyenv-managed Python 3.10}
+\begin{lstlisting}
+wsl --install -d Ubuntu-22.04
+
+# Inside the WSL2 Ubuntu shell:
+curl https://pyenv.run | bash
+# add pyenv init to ~/.bashrc as instructed by the installer, then:
+pyenv install 3.10.14
+pyenv virtualenv 3.10.14 hailo_dfc_530_py310
+pyenv activate hailo_dfc_530_py310
+\end{lstlisting}
+
+\subsection{Install Hailo DFC 5.3.0}
+Download the DFC \texttt{.whl} package for your DFC version from the Hailo
+Developer Zone (requires a free Hailo account) and install it inside the
+virtual environment created above:
+\begin{lstlisting}
+source ~/.pyenv/versions/3.10.14/envs/hailo_dfc_530_py310/bin/activate
+pip install hailo_dataflow_compiler-5.3.0-*.whl
+hailo --version   # sanity check
+\end{lstlisting}
+
+\textbf{Note on GPU}: without a supported NVIDIA GPU visible inside WSL2,
+DFC automatically falls back to CPU-only optimization at level~0
+(``the accuracy won't be optimized and compression won't be used''). This is
+sufficient for compatibility/performance testing (this manual and the
+accompanying report's results were produced this way) but is \textbf{not}
+representative of production accuracy -- for production deployments, run
+optimization on a machine with a compatible GPU and a real calibration
+dataset (not \texttt{--use-random-calib-set}).
+
+\subsection{Environment variables used by the MIMaaS backend}
+The backend (\texttt{src/mimaas/hardware/hailo\_utils.py}) picks up the
+following environment variables, with sensible defaults:
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Variable} & \textbf{Default} \\
+\hline
+\texttt{HAILO\_DFC\_VENV} & \texttt{hailo\_dfc\_530\_py310} \\
+\texttt{HAILO\_HW\_ARCH} & \texttt{hailo10h} \\
+\texttt{HAILO\_SSH\_PREP\_TIMEOUT\_S} & 20 \\
+\texttt{HAILO\_SCP\_TRANSFER\_TIMEOUT\_S} & 120 \\
+\texttt{HAILO\_SSH\_INFERENCE\_TIMEOUT\_S} & 900 \\
+\end{tabular}
+\end{center}
+If your pyenv virtualenv has a different name, set
+\texttt{HAILO\_DFC\_VENV} accordingly before starting the MIMaaS worker.
+
+\section{Part C -- MIMaaS Server Configuration}
+
+\subsection{Board configuration file}
+Add or verify the board definition at
+\texttt{config/boards/hailo\_pi5.yaml}:
+\begin{lstlisting}
+value:
+- variant: hailo_rpi5
+  board_type: hailo_rpi5
+  board_snr: "HAILO10_PI5_01"
+  ppk2_snr: "N/A"
+  uart_port_type: none
+  voltage: 5000
+  power_measurement_threshold: 1000
+  max_available_tensor_arena_size: 0
+  flash_size: 32768
+  ram_size: 2048
+  host: "192.168.42.1"       # <- IP of your Raspberry Pi 5
+  ssh_user: "maxime"          # <- SSH user on the Pi
+  processor: "Cortex-A76"
+  npu: "Hailo-10"
+  supported_formats:
+    - ".hef"
+    - ".tflite"
+  max_model_size_mb: 50
+\end{lstlisting}
+Adjust \texttt{host} and \texttt{ssh\_user} to match your Pi's network
+configuration and SSH account.
+
+\subsection{Install the MIMaaS package}
+On the machine that will run the API/worker (can be Windows; the DFC calls
+are automatically routed into WSL2 by the backend):
+\begin{lstlisting}
+git clone <repository-url> mimaas-server
+cd mimaas-server
+python3 -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+
+pip install -e .
+\end{lstlisting}
+
+\section{Part D -- Running a Full Test}
+
+\subsection{Ad-hoc test via the pipeline API}
+The fastest way to validate an end-to-end setup is to call
+\texttt{flash\_and\_evaluate()} directly:
+\begin{lstlisting}
+from mimaas.core.pipeline import flash_and_evaluate
+from mimaas.models.board import Board
+
+board = Board.from_config("hailo_pi5")
+
+# Case 1: a pre-compiled .hef -- skips DFC entirely
+result = flash_and_evaluate("/path/to/model.hef", board)
+
+# Case 2: a .tflite -- triggers parser -> optimize -> compiler in WSL2
+result = flash_and_evaluate("/path/to/model.tflite", board)
+
+print(result)
+# {'status': 'flash_and_eva_successful', ...}
+\end{lstlisting}
+
+A successful result includes the parsed \texttt{hailortcli} summary: FPS and
+Hailo-10H chip temperature (mean/min/max), in addition to the standard
+MIMaaS result fields (ROM usage in MB, host RAM usage).
+
+\subsection{Via the REST API / worker (production path)}
+Once the API server and a Celery worker for the \texttt{hailo\_pi5} queue are
+running (see \texttt{docs/START\_SYSTEM.md} for the generic API/worker/Redis
+bring-up steps), submit a request exactly as for MCU boards:
+\begin{lstlisting}
+curl -X POST http://127.0.0.1:5000/api/requests/ \
+  -H "Authorization: YOUR_API_TOKEN" \
+  -F "network=@/path/to/model.tflite" \
+  -F "board=hailo_pi5"
+\end{lstlisting}
+
+\section{Troubleshooting}
+
+\subsection{``FileNotFoundError: efficientnetb3\_opt.har'' (or similar) after
+an \texttt{optimize} failure}
+If \texttt{hailo optimize} fails partway through (e.g.\ a quantization
+error), it does \emph{not} write the output \texttt{\_opt.har} file. Do not
+chain the \texttt{compiler} command unconditionally after
+\texttt{optimize} in a shell script -- check the optimize step's exit code
+first, or run steps one at a time as shown in this manual.
+
+\subsection{``Shift delta in .../avgpool.../avgpool\_op is larger than 2''}
+This is a quantization limitation of the model's global-average-pool layer(s),
+not a bug in your setup. Try forcing that specific layer to 16-bit precision
+via a model script before re-running \texttt{optimize}:
+\begin{lstlisting}
+cat > model.alls <<'ALLS'
+quantization_param(avgpool1, precision_mode=a16_w16)
+ALLS
+
+hailo optimize model.har --hw-arch hailo10h --use-random-calib-set \
+  --model-script model.alls --output-har-path model_opt.har
+\end{lstlisting}
+If the error reappears on a \emph{different} average-pool layer name (e.g.\
+\texttt{avgpool2}), the model likely has multiple squeeze-and-excitation
+blocks and this single-layer workaround will not scale; see Section~5.2.1 of
+the accompanying report for a discussion of when this is/is not fixable.
+
+\subsection{Parser interactively asks ``Would you like to parse again with
+the recommendation? (y/n)'' and then crashes with \texttt{EOFError}}
+This happens when the parser fails and offers an automatic recommendation,
+but is invoked without a TTY (e.g.\ from a Python subprocess), so it cannot
+read the interactive answer. Re-run the \texttt{hailo parser} command with
+the \texttt{-y} flag to auto-accept parser recommendations. Note that for
+some architectures (e.g.\ ConvNeXt, whose LayerNorm decomposition uses
+operations the parser does not support at all) accepting the recommendation
+still will not produce a working graph -- see the failure taxonomy in the
+report.
+
+\subsection{WSL2 runs out of memory during compilation}
+Large models (100M+ parameters, e.g.\ VGG16) can exhaust a WSL2 VM's default
+memory allocation. Monitor memory during a compile with
+\texttt{watch -n 2 free -h} in a second WSL2 terminal, and avoid running more
+than one DFC compilation at a time. If needed, increase the WSL2 memory cap
+in \texttt{.wslconfig} (Windows user profile directory) and restart WSL2
+(\texttt{wsl --shutdown}).
+
+\subsection{SSH commands hang or time out}
+Confirm the Pi is reachable (\texttt{ping 192.168.42.1}) and that
+\texttt{ssh -o BatchMode=yes maxime@192.168.42.1 echo ok} succeeds
+non-interactively \emph{before} involving MIMaaS -- \texttt{BatchMode=yes}
+means any authentication prompt will fail the connection immediately rather
+than hang.
+
+\end{document}
